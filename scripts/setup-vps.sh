@@ -27,7 +27,11 @@ APP_DIR="/opt/${APP_NAME}"
 APP_USER="binapi"
 APP_PORT="${PORT:-3000}"
 DOMAIN="${DOMAIN:-}"
-REPO_URL="${REPO_URL:-}"
+REPO_URL="${REPO_URL:-https://github.com/afuzapratama/Bin-card.git}"
+
+# Auto-detect project root (in case script is run from within the repo)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd || echo "")"
 
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
@@ -81,21 +85,27 @@ fi
 log "Setting up application directory..."
 mkdir -p "$APP_DIR"
 
-if [ -n "$REPO_URL" ]; then
-  log "Cloning from: ${REPO_URL}"
-  git clone "$REPO_URL" "$APP_DIR" 2>/dev/null || {
-    warn "Directory exists, pulling latest..."
-    cd "$APP_DIR" && git pull
-  }
-else
-  # Copy from current directory if no repo URL
-  if [ -f "package.json" ]; then
-    log "Copying local project files..."
-    cp -r . "$APP_DIR/"
+# Detect if we're running from inside the cloned repo
+if [ -n "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/package.json" ]; then
+  if [ "$(realpath "$PROJECT_DIR")" != "$(realpath "$APP_DIR")" ]; then
+    log "Detected project at: ${PROJECT_DIR}"
+    log "Copying to ${APP_DIR}..."
+    cp -a "$PROJECT_DIR/"* "$APP_DIR/" 2>/dev/null || true
+    cp -a "$PROJECT_DIR/".* "$APP_DIR/" 2>/dev/null || true
   else
-    warn "No REPO_URL set and no local project found."
-    warn "Please copy your project to ${APP_DIR} manually."
+    log "Already running from ${APP_DIR}"
   fi
+elif [ -n "$REPO_URL" ]; then
+  if [ -d "$APP_DIR/.git" ]; then
+    log "Pulling latest from: ${REPO_URL}"
+    cd "$APP_DIR" && git pull
+  else
+    log "Cloning from: ${REPO_URL}"
+    git clone "$REPO_URL" "$APP_DIR"
+  fi
+else
+  warn "No project found and no REPO_URL set."
+  warn "Please copy your project to ${APP_DIR} manually."
 fi
 
 cd "$APP_DIR"
