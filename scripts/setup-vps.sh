@@ -1,0 +1,303 @@
+#!/bin/bash
+# =============================================================
+# BIN Card API - VPS Setup Script
+# 
+# Supported OS: Ubuntu 22.04+ / Debian 12+
+# Run as root: curl -sSL <url> | bash
+# Or: chmod +x setup-vps.sh && sudo ./setup-vps.sh
+# =============================================================
+
+set -euo pipefail
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() { echo -e "${GREEN}[✓]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+err() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+info() { echo -e "${BLUE}[i]${NC} $1"; }
+
+# Configuration
+APP_NAME="api-bin-card"
+APP_DIR="/opt/${APP_NAME}"
+APP_USER="binapi"
+APP_PORT="${PORT:-3000}"
+DOMAIN="${DOMAIN:-}"
+REPO_URL="${REPO_URL:-}"
+
+echo ""
+echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║    BIN Card API - VPS Setup Script       ║${NC}"
+echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+echo ""
+
+# Check root
+if [ "$EUID" -ne 0 ]; then
+  err "Please run as root (sudo ./setup-vps.sh)"
+fi
+
+# =============================================================
+# Step 1: System update & essentials
+# =============================================================
+log "Updating system packages..."
+apt-get update -qq && apt-get upgrade -y -qq
+
+log "Installing essentials..."
+apt-get install -y -qq curl wget git unzip ufw fail2ban sqlite3 \
+  ca-certificates gnupg lsb-release > /dev/null 2>&1
+
+# =============================================================
+# Step 2: Install Bun
+# =============================================================
+if ! command -v bun &> /dev/null; then
+  log "Installing Bun..."
+  curl -fsSL https://bun.sh/install | bash
+  export BUN_INSTALL="$HOME/.bun"
+  export PATH="$BUN_INSTALL/bin:$PATH"
+  # Make bun available system-wide
+  ln -sf "$HOME/.bun/bin/bun" /usr/local/bin/bun
+  log "Bun $(bun --version) installed"
+else
+  log "Bun $(bun --version) already installed"
+fi
+
+# =============================================================
+# Step 3: Create app user
+# =============================================================
+if ! id "$APP_USER" &>/dev/null; then
+  log "Creating user: ${APP_USER}"
+  useradd -r -m -s /bin/bash "$APP_USER"
+else
+  log "User ${APP_USER} already exists"
+fi
+
+# =============================================================
+# Step 4: Setup application
+# =============================================================
+log "Setting up application directory..."
+mkdir -p "$APP_DIR"
+
+if [ -n "$REPO_URL" ]; then
+  log "Cloning from: ${REPO_URL}"
+  git clone "$REPO_URL" "$APP_DIR" 2>/dev/null || {
+    warn "Directory exists, pulling latest..."
+    cd "$APP_DIR" && git pull
+  }
+else
+  # Copy from current directory if no repo URL
+  if [ -f "package.json" ]; then
+    log "Copying local project files..."
+    cp -r . "$APP_DIR/"
+  else
+    warn "No REPO_URL set and no local project found."
+    warn "Please copy your project to ${APP_DIR} manually."
+  fi
+fi
+
+cd "$APP_DIR"
+
+log "Installing dependencies..."
+bun install --production
+
+# Create data directory
+mkdir -p data data/cache
+
+# Seed database if not exists
+if [ ! -f "data/bin.db" ]; then
+  log "Seeding BIN database (downloading from GitHub)..."
+  bun run src/scripts/seed.ts
+  log "Database seeded!"
+else
+  log "Database already exists ($(du -h data/bin.db | cut -f1))"
+fi
+
+# Set ownership
+chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+
+# =============================================================
+# Step 5: Create systemd service
+# =============================================================
+log "Creating systemd service..."
+cat > /etc/systemd/system/${APP_NAME}.service << EOF
+[Unit]
+Description=BIN Card Lookup API
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=${APP_USER}
+Group=${APP_USER}
+WorkingDirectory=${APP_DIR}
+ExecStart=/usr/local/bin/bun run src/index.ts
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PORT=${APP_PORT}
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${APP_DIR}/data
+PrivateTmp=true
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=100%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${APP_NAME}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable "$APP_NAME"
+systemctl restart "$APP_NAME"
+log "Service started!"
+
+# =============================================================
+# Step 6: Create weekly update cron
+# =============================================================
+log "Setting up weekly data update cron..."
+cat > /etc/cron.d/${APP_NAME}-update << EOF
+# Update BIN data every Sunday at 3 AM
+0 3 * * 0 ${APP_USER} cd ${APP_DIR} && /usr/local/bin/bun run src/scripts/update.ts >> ${APP_DIR}/data/update.log 2>&1
+EOF
+chmod 644 /etc/cron.d/${APP_NAME}-update
+
+# =============================================================
+# Step 7: Firewall setup
+# =============================================================
+log "Configuring firewall..."
+ufw --force reset > /dev/null 2>&1
+ufw default deny incoming > /dev/null 2>&1
+ufw default allow outgoing > /dev/null 2>&1
+ufw allow ssh > /dev/null 2>&1
+ufw allow 80/tcp > /dev/null 2>&1
+ufw allow 443/tcp > /dev/null 2>&1
+ufw allow "$APP_PORT/tcp" > /dev/null 2>&1
+ufw --force enable > /dev/null 2>&1
+log "Firewall configured (SSH, HTTP, HTTPS, port ${APP_PORT})"
+
+# =============================================================
+# Step 8: Setup Nginx reverse proxy (optional)
+# =============================================================
+setup_nginx() {
+  log "Installing Nginx..."
+  apt-get install -y -qq nginx > /dev/null 2>&1
+
+  cat > /etc/nginx/sites-available/${APP_NAME} << NGINX
+# Rate limiting zone
+limit_req_zone \$binary_remote_addr zone=api:10m rate=30r/s;
+
+upstream bin_api {
+    server 127.0.0.1:${APP_PORT};
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name ${DOMAIN:-_};
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Gzip
+    gzip on;
+    gzip_types application/json;
+    gzip_min_length 256;
+
+    location / {
+        limit_req zone=api burst=50 nodelay;
+
+        proxy_pass http://bin_api;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+
+        # Timeouts
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 10s;
+        proxy_read_timeout 10s;
+    }
+
+    # Health check (no rate limit)
+    location /health {
+        proxy_pass http://bin_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+    }
+}
+NGINX
+
+  ln -sf /etc/nginx/sites-available/${APP_NAME} /etc/nginx/sites-enabled/
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t && systemctl restart nginx
+  log "Nginx configured as reverse proxy"
+
+  # Setup SSL with Let's Encrypt if domain is set
+  if [ -n "$DOMAIN" ]; then
+    log "Setting up SSL with Let's Encrypt for ${DOMAIN}..."
+    apt-get install -y -qq certbot python3-certbot-nginx > /dev/null 2>&1
+    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "admin@${DOMAIN}" || {
+      warn "SSL setup failed. Run manually: certbot --nginx -d ${DOMAIN}"
+    }
+  fi
+}
+
+setup_nginx
+
+# =============================================================
+# Step 9: Setup fail2ban
+# =============================================================
+log "Configuring fail2ban..."
+systemctl enable fail2ban > /dev/null 2>&1
+systemctl start fail2ban > /dev/null 2>&1
+
+# =============================================================
+# Done!
+# =============================================================
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║          Setup Complete!                         ║${NC}"
+echo -e "${GREEN}╠══════════════════════════════════════════════════╣${NC}"
+echo -e "${GREEN}║                                                  ║${NC}"
+echo -e "${GREEN}║  API running at:                                 ║${NC}"
+echo -e "${GREEN}║    http://$(hostname -I | awk '{print $1}'):${APP_PORT}                        ║${NC}"
+if [ -n "$DOMAIN" ]; then
+echo -e "${GREEN}║    https://${DOMAIN}                             ║${NC}"
+fi
+echo -e "${GREEN}║                                                  ║${NC}"
+echo -e "${GREEN}║  Useful commands:                                ║${NC}"
+echo -e "${GREEN}║    systemctl status ${APP_NAME}              ║${NC}"
+echo -e "${GREEN}║    journalctl -u ${APP_NAME} -f             ║${NC}"
+echo -e "${GREEN}║    systemctl restart ${APP_NAME}             ║${NC}"
+echo -e "${GREEN}║                                                  ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+echo ""
+
+# Quick health check
+sleep 2
+if curl -sf http://localhost:${APP_PORT}/health > /dev/null 2>&1; then
+  log "Health check passed! API is running."
+  curl -s http://localhost:${APP_PORT}/health | python3 -m json.tool 2>/dev/null || true
+else
+  warn "API might still be starting up. Check: systemctl status ${APP_NAME}"
+fi

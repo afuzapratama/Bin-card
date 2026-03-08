@@ -1,0 +1,10 @@
+# Data directory
+# BIN database and cached files stored here
+
+*.db
+*.db-wal
+*.db-shm
+cache/
+*.csv
+*.log
+!.gitkeep

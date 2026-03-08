@@ -1,0 +1,26 @@
+{
+  "name": "api-bin-card",
+  "version": "1.0.0",
+  "description": "Fast BIN/IIN card lookup API with free data sources",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "NODE_ENV=production bun run src/index.ts",
+    "seed": "bun run src/scripts/seed.ts",
+    "update-data": "bun run src/scripts/update.ts",
+    "import-csv": "bun run src/scripts/import-csv.ts"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "hono": "^4.12.5"
+  }
+}
