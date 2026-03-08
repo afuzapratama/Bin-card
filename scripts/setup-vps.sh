@@ -199,24 +199,62 @@ ufw --force enable > /dev/null 2>&1
 log "Firewall configured (SSH, HTTP, HTTPS, port ${APP_PORT})"
 
 # =============================================================
-# Step 8: Setup Nginx reverse proxy (optional)
+# Step 8: Setup Nginx reverse proxy + SSL
 # =============================================================
 setup_nginx() {
-  log "Installing Nginx..."
-  apt-get install -y -qq nginx > /dev/null 2>&1
+  # Interactive domain prompt if not set via env
+  if [ -z "$DOMAIN" ]; then
+    echo ""
+    echo -e "${BLUE}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║  Nginx Reverse Proxy + SSL Setup                 ║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║                                                  ║${NC}"
+    echo -e "${BLUE}║  Arahkan domain/subdomain ke IP VPS ini dulu:    ║${NC}"
+    echo -e "${BLUE}║    IP: $(hostname -I | awk '{print $1}')${NC}"
+    echo -e "${BLUE}║                                                  ║${NC}"
+    echo -e "${BLUE}║  Contoh DNS Record (di Cloudflare/registrar):    ║${NC}"
+    echo -e "${BLUE}║    Type: A                                       ║${NC}"
+    echo -e "${BLUE}║    Name: bin (atau api, atau @)                   ║${NC}"
+    echo -e "${BLUE}║    Value: $(hostname -I | awk '{print $1}')${NC}"
+    echo -e "${BLUE}║    Proxy: DNS only (grey cloud) untuk SSL         ║${NC}"
+    echo -e "${BLUE}║                                                  ║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+    read -rp "Masukkan domain (contoh: bin.example.com) atau tekan Enter untuk skip: " DOMAIN
+    echo ""
+  fi
 
+  if [ -z "$DOMAIN" ]; then
+    warn "Domain tidak diisi, skip Nginx setup."
+    warn "API tetap bisa diakses via: http://$(hostname -I | awk '{print $1}'):${APP_PORT}"
+    warn "Jalankan ulang dengan: DOMAIN=bin.example.com sudo -E ./scripts/setup-vps.sh"
+    return 0
+  fi
+
+  log "Setting up Nginx for domain: ${DOMAIN}"
+
+  # Install nginx & certbot if not installed
+  if ! command -v nginx &> /dev/null; then
+    log "Installing Nginx..."
+    apt-get install -y -qq nginx > /dev/null 2>&1
+  else
+    log "Nginx already installed"
+  fi
+
+  # Create vhost config (does NOT touch default or other sites)
   cat > /etc/nginx/sites-available/${APP_NAME} << NGINX
-# Rate limiting zone
-limit_req_zone \$binary_remote_addr zone=api:10m rate=30r/s;
+# BIN Card API - ${DOMAIN}
+# Rate limiting zone (unique name to avoid conflict)
+limit_req_zone \$binary_remote_addr zone=binapi:10m rate=30r/s;
 
-upstream bin_api {
+upstream bin_api_backend {
     server 127.0.0.1:${APP_PORT};
     keepalive 32;
 }
 
 server {
     listen 80;
-    server_name ${DOMAIN:-_};
+    server_name ${DOMAIN};
 
     # Security headers
     add_header X-Frame-Options "SAMEORIGIN" always;
@@ -230,9 +268,9 @@ server {
     gzip_min_length 256;
 
     location / {
-        limit_req zone=api burst=50 nodelay;
+        limit_req zone=binapi burst=50 nodelay;
 
-        proxy_pass http://bin_api;
+        proxy_pass http://bin_api_backend;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection 'upgrade';
@@ -250,25 +288,39 @@ server {
 
     # Health check (no rate limit)
     location /health {
-        proxy_pass http://bin_api;
+        proxy_pass http://bin_api_backend;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
     }
 }
 NGINX
 
+  # Enable site (tanpa hapus default atau site lain!)
   ln -sf /etc/nginx/sites-available/${APP_NAME} /etc/nginx/sites-enabled/
-  rm -f /etc/nginx/sites-enabled/default
-  nginx -t && systemctl restart nginx
-  log "Nginx configured as reverse proxy"
 
-  # Setup SSL with Let's Encrypt if domain is set
-  if [ -n "$DOMAIN" ]; then
-    log "Setting up SSL with Let's Encrypt for ${DOMAIN}..."
-    apt-get install -y -qq certbot python3-certbot-nginx > /dev/null 2>&1
-    certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "admin@${DOMAIN}" || {
-      warn "SSL setup failed. Run manually: certbot --nginx -d ${DOMAIN}"
-    }
+  # Test config before reload
+  if nginx -t 2>/dev/null; then
+    systemctl reload nginx
+    log "Nginx vhost configured: http://${DOMAIN}"
+  else
+    err "Nginx config test failed! Check: nginx -t"
+  fi
+
+  # Setup SSL with Let's Encrypt
+  log "Installing Certbot for SSL..."
+  apt-get install -y -qq certbot python3-certbot-nginx > /dev/null 2>&1
+
+  info "Requesting SSL certificate for ${DOMAIN}..."
+  read -rp "Masukkan email untuk SSL (contoh: admin@gmail.com): " SSL_EMAIL
+  SSL_EMAIL="${SSL_EMAIL:-admin@${DOMAIN}}"
+
+  if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "$SSL_EMAIL" 2>/dev/null; then
+    log "SSL berhasil! API ready di: https://${DOMAIN}"
+  else
+    warn "SSL gagal. Kemungkinan domain belum pointing ke IP ini."
+    warn "Pastikan DNS A record ${DOMAIN} → $(hostname -I | awk '{print $1}')"
+    warn "Lalu jalankan manual: certbot --nginx -d ${DOMAIN}"
+    info "API tetap bisa diakses via: http://${DOMAIN}"
   fi
 }
 
@@ -292,13 +344,16 @@ echo -e "${GREEN}║                                                  ║${NC}"
 echo -e "${GREEN}║  API running at:                                 ║${NC}"
 echo -e "${GREEN}║    http://$(hostname -I | awk '{print $1}'):${APP_PORT}                        ║${NC}"
 if [ -n "$DOMAIN" ]; then
-echo -e "${GREEN}║    https://${DOMAIN}                             ║${NC}"
+echo -e "${GREEN}║    https://${DOMAIN}$(printf '%*s' $((36 - ${#DOMAIN})) '')║${NC}"
 fi
 echo -e "${GREEN}║                                                  ║${NC}"
-echo -e "${GREEN}║  Useful commands:                                ║${NC}"
+echo -e "${GREEN}║  Commands:                                       ║${NC}"
 echo -e "${GREEN}║    systemctl status ${APP_NAME}              ║${NC}"
 echo -e "${GREEN}║    journalctl -u ${APP_NAME} -f             ║${NC}"
 echo -e "${GREEN}║    systemctl restart ${APP_NAME}             ║${NC}"
+if [ -n "$DOMAIN" ]; then
+echo -e "${GREEN}║    certbot renew --dry-run  (test SSL renewal)    ║${NC}"
+fi
 echo -e "${GREEN}║                                                  ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
