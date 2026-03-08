@@ -298,9 +298,13 @@ NGINX
   # Enable site (tanpa hapus default atau site lain!)
   ln -sf /etc/nginx/sites-available/${APP_NAME} /etc/nginx/sites-enabled/
 
-  # Test config before reload
+  # Test config, then start or reload
   if nginx -t 2>/dev/null; then
-    systemctl reload nginx
+    if systemctl is-active --quiet nginx; then
+      systemctl reload nginx
+    else
+      systemctl start nginx
+    fi
     log "Nginx vhost configured: http://${DOMAIN}"
   else
     err "Nginx config test failed! Check: nginx -t"
